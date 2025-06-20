@@ -190,7 +190,7 @@ macro_summary <- PM_data %>% #Re-group by macro level
     owners = sum(ownerE),
     total = sum(totalE),
     .groups = "drop"
-  ) %>% #percents deleted after the drop operation; manually adding them back
+  ) %>% #percent columns deleted after the drop operation; manually adding them back
   mutate(
     percent_rent = renters / total,
     percent_own = owners / total
