@@ -107,7 +107,7 @@ Diver_tenure <-divergence(
   summed = TRUE
 )
 
-#3.5 Entropy for Theil's H
+#3.5 MSA Entropy for Theil's H
 entropy_msa <-segregation::entropy(
   long_pm,
   group = "tenure",
@@ -121,6 +121,7 @@ entropy_tract <- long_pm %>%
     t_i = sum(n),
     E_i = segregation::entropy(pick(everything()),group = "tenure", weight ="n", base = 2)
   )
+
 sigmpa_part <- sum(entropy_tract$t_i/total_msa*entropy_tract$E_i)
 
 #plug all partd into Theil Index's formula
@@ -143,18 +144,19 @@ summary <-tibble(
 long_MacroPM <- long_pm %>%  #long format
   mutate(
     macro_level = case_when(
-      substr(GEOID, 1,5) == "42101" ~ "city",
+      substr(GEOID, 1,5) %in% c("42101","34007", "10003") ~ "city",
       TRUE ~ "suburb"
-    )
-  )
+ )
+  )  
 
 PM_data <- PM_data %>% #wide format (for divergence)
   mutate(
     macro_level = case_when(
-      substr(GEOID, 1,5) == "42101" ~ "city",
+      substr(GEOID, 1,5) %in% c("42101","34007", "10003") ~ "city",
       TRUE ~ "suburb"
     )
   )
+
 #4.1 Dissimilarity on a macro level - city vs. suburbs？
 D_macro <-segregation::dissimilarity(
   long_MacroPM,
@@ -164,7 +166,7 @@ D_macro <-segregation::dissimilarity(
 )
 
 
-#4.2 Divergence on macro level
+#4.2 Divergence on Macro Level
 #We just need to introduce grouping by places.
 Div_macro <- PM_data %>%
   group_by(macro_level) %>%
@@ -178,6 +180,33 @@ Div_macro <- PM_data %>%
     )
   )
 
+#4.3 Theil's H Index on Macro Level
+#Use rsegregation package; Tried the segrgegation package which still involves
+#a lot manual calculations (very easy to get messy).
+macro_summary <- PM_data %>% #Re-group by macro level
+  group_by(macro_level) %>%
+  summarise(
+    renters = sum(renterE),
+    owners = sum(ownerE),
+    total = sum(totalE),
+    .groups = "drop"
+  ) %>% #percents deleted after the drop operation; manually adding them back
+  mutate(
+    percent_rent = renters / total,
+    percent_own = owners / total
+  )
+
+H_between_macro <- rsegregation::entropy(
+  macro_summary$percent_rent,
+  macro_summary$percent_own,
+  population = macro_summary$total,
+  comparison = comparison_tenure,
+  entropy_type = "information_theory",
+  logBase = 2,
+  summed = TRUE
+)
+
+
 #Overall Summary
 suppressMessages({
   suppressWarnings({
@@ -189,6 +218,9 @@ suppressMessages({
     
     cat("\nMacro-level Divergence:\n")
     print(Div_macro)
+    
+    cat("\nMacro-level Theil's H:\n")
+    print(H_between_macro)
   }
   )
 })
