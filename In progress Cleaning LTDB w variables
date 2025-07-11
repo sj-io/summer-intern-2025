@@ -1,0 +1,333 @@
+library(tidycensus)
+library(tidyverse) 
+library(readr) 
+library(stringr) 
+library(dplyr) 
+library(tidyr) 
+
+library(tidycensus)
+data(fips_codes)
+print(names(fips_codes))
+
+data(fips_codes)
+all_states_abbr <-fips_codes %>% 
+  filter(state!="PR" & state_name !="Puerto Rico" & !is.na(state_name))  %>% 
+  pull(state)  %>% 
+  unique ()
+# Step 1
+# Load the crosswalk for MSA and make 11-digit GEOID using 'county' and 'tract'
+
+crosswalk <-read_csv("geocorr_tract_to_cbsa_2018.csv",
+                    col_types=cols(
+                      county=col_character(), 
+                      tract=col_character(),
+                      cbsa13=col_character()
+                    ), 
+                    show_col_types=FALSE) %>%
+  mutate(
+    # Here I make the GEOID using 'county' and 'tract'
+    # County is defined as the state FIPS and the county FIPS 
+    # Tract is defined as the 6-digit tract number without the decimal
+    GEOID= paste0(
+      str_pad(county,5,"left","0"), 
+      str_pad(str_remove(tract,"\\."),6,"left","0")
+    )
+  )
+# Step 2 
+# Find the top most populated 100 MSAs in 2010 
+msa_pop_2010 <-crosswalk %>%
+  group_by(cbsa13,cbsaname) %>%
+  summarise(population=sum(pop10,na.rm=TRUE),.groups='drop')  %>%
+  arrange(desc(population))  %>%
+  slice_head(n=100)
+top_msa_fips <- msa_pop_2010$cbsa13
+
+# Step 3 
+# Standardize all the different variable names 
+standardize_ltdb_vars<-function(df,year_val) {
+  df_out<-df 
+  var_mappings<-list(
+ "total_pop"=c(paste0("POP", substr(year_val,3,4)), paste0("pop",substr(year_val,3,4)),"pop80sf3"), 
+ "nhwht"= c(paste0("NHWHT",substr(year_val,3,4)),paste0("nhwht", substr(year_val,3,4)),paste0("nhwt",substr(year_val,3,4))),
+ "nhblk"=c(paste0("NHBLK",substr(year_val,3,4)),paste0("nhblk",substr(year_val,3,4))), 
+ "ntv"=c(paste0("NTV",substr(year_val,3,4)),paste0("ntv",substr(year_val,3,4))), 
+ "asian"=c(paste0("ASIAN",substr(year_val,3,4)),paste0("asian",substr(year_val,3,4))), 
+ "hisp"=c(paste0("HISP",substr(year_val,3,4)),paste0("hisp",substr(year_val,3,4))), 
+ "owner"=c(paste0("OWN",substr(year_val,3,4)),paste0("own",substr(year_val,3,4))), 
+ "renter"=c(paste0("RENT",substr(year_val,3,4)),paste0("rent",substr(year_val,3,4))), 
+ "occhh"=c(paste0("OHU",substr(year_val,3,4)),paste0("ohu",substr(year_val,3,4)),
+  "ohu80sp"),
+ "hinc"=c(paste0("HINC",substr(year_val,3,4)),paste0("hinc",substr(year_val,3,4))), 
+ "npov"=c(paste0("NPOV",substr(year_val,3,4)),paste0("npov",substr(year_val,3,4))),
+ "fb"=c(paste0("FB",substr(year_val,3,4)),paste0("fb",substr(year_val,3,4))), 
+ "fhh"=c(paste0("FHH",substr(year_val,3,4)),paste0("fhh",substr(year_val,3,4)))
+ 
+  ) 
+ 
+for(target_var in names(var_mappings)) {
+  possible_names_ <-var_mappings[[target_var]]
+  found_source_col <- NA_character_
+  
+for(s_name in possible_names_) {
+  if (s_name %in% names(df_out)) {
+    found_source_col <- s_name
+    break 
+  }
+}
+  if(!is.na(found_source_col)){
+    df_out<-df_out %>% rename(!!sym(target_var):=!!sym(found_source_col))
+  }
+}
+ return(df_out)
+}
+# Make the GEOID standard in name 
+
+rename_and_standardize_geoid_initial<-function(df_raw,year_val){
+  geoid_possible_options <-c("tractid","trtid10","TRTID10","TRACTID10","TRTID2010","GEOID10","GEOID","tract")
+  correct_geoid_col <-NA_character_
+  
+  for(g_opt in geoid_possible_options) {
+    if(g_opt %in% trimws(names(df_raw))){
+    correct_geoid_col<-g_opt 
+    break 
+    }
+  }
+  if(!is.na(correct_geoid_col)) {
+    names(df_raw)<-trimws(names(df_raw))
+    df_processed<-df_raw %>% 
+      rename(tractid=!!sym(correct_geoid_col)) %>% 
+      mutate(tractid=as.character(tractid))
+  } else {
+    df_processed <-df_raw %>% mutate(tractid=NA_character_)
+    warning(paste("no shared GEOID found")) 
+  }
+  return(df_processed)
+} 
+  merge_fullsample<-function(full_df,sample_df){
+    full_df_selected <-full_df %>%
+      select(tractid,total_pop,nhwht,nhblk,ntv,asian,hisp,owner,renter,occhh)
+    
+    sample_df_selected<-sample_df %>%
+      select(tractid,hinc,npov,fb,fhh)
+    
+    merged_df <-full_df_selected  %>%
+      left_join(sample_df_selected, by="tractid")
+    
+    return(merged_df)
+  }
+  # Load the different decades of the LTDB 
+  # I use supplements for the 1980 and 1990 missing variables with thesample LTDB for 1980 and 1990 for 
+  # hinc (householdincome),fb(foreign born),npov(number in poverty), and fhh(female head of household)
+  # I use the acs survey from 2012 to supplement information for 2010 and the acs survey from 2019 to supplment information for 2020
+  # I also used the 2010 to 2020 relationship file and use the DHC 2020 census for H1 H3 and H4 which were omitted in the LTDB 
+  
+  
+  #1980 both from the full count and sample count 
+  
+  ltdb_1980_full<-read_csv("LTDB_Std_1980_fullcount.csv",show_col_types =FALSE) %>%  
+  rename_and_standardize_geoid_initial(1980)  %>%  
+  standardize_ltdb_vars(1980)
+  
+  ltdb_1980_sample<-read_csv("LTDB_Std_1980_Sample.csv",show_col_types =FALSE) %>%
+    rename_and_standardize_geoid_initial(1980)  %>%  
+    standardize_ltdb_vars(1980)
+  ltdb_1980 <-merge_full_sample(ltdb_1980_full,ltdb_1980_sample)
+  
+#1990 full and sample joined 
+  ltdb_1990_full<-read_csv("LTDB_Std_1990_fullcount.csv",show_col_types =FALSE) %>%  
+    rename_and_standardize_geoid_initial(1990)  %>%  
+    standardize_ltdb_vars(1990)
+  
+  ltdb_1990_sample<-read_csv("LTDB_Std_1990_Sample.csv",show_col_types =FALSE) %>%
+    rename_and_standardize_geoid_initial(1990)  %>%  
+    standardize_ltdb_vars(1990)
+  
+  ltdb_1990 <-merge_full_sample(ltdb_1990_full,ltdb_1990_sample)
+#2000 
+  ltdb_2000<-read_csv("LTDB_Std_2000_fullcount.csv",show_col_types =FALSE) %>%  
+    rename_and_standardize_geoid_initial(2000)  %>%  
+    standardize_ltdb_vars(2000)
+#2010  
+  ltdb_2010<-read_csv("LTDB_Std_2010_fullcount.csv",show_col_types =FALSE) %>%
+    rename_and_standardize_geoid_initial(2010)  %>%  
+    standardize_ltdb_vars(2010)
+#2012
+  ltdb_2012<-read_csv("LTDB_Std_2008_12.csv",show_col_types =FALSE) %>%
+  rename_and_standardize_geoid_initial(2012)  %>%  
+  standardize_ltdb_vars(2012)
+  
+  #2019
+  ltdb_2019<-read_csv("LTDB_Std_2015_19.csv",show_col_types =FALSE) %>%
+    rename_and_standardize_geoid_initial(2019)  %>%  
+    standardize_ltdb_vars(2019)
+  
+# 2020 data with three different sources:
+# the 2020 LTDB data, the 2020 Decennial DHC for housing H1 H3 H4 and the 2016-2020 ACS survey
+ 
+  # The LTDB data is the same 2010 already 
+  ltdb_2020_full<-read_csv("LTDB_Std_2020.csv",show_col_types =FALSE) %>% 
+    rename_and_standardize_geoid_initial(2020)  %>%  
+    standardize_ltdb_vars(2020)
+  # this is the tract relationship file for 2010 and 2020 
+  tract_crosswalk_2010_to_2020 <-read_csv("2010_2020_Tract_Rel.csv",
+                                          col_types = cols(GEOID_TRACT_10=col_character(),GEOID_TRACT_20=col_character()), 
+                                          show_col_types=FALSE)  %>%  
+  select(GEOID10= GEOID_TRACT_10,GEOID20=GEOID_TRACT_20)
+  
+#Getting housing variables from 2020 Decennial 
+census_2020_dhc_raw<-get_decennial(
+  geography = "tract",
+  variables = c (
+    owner_dhc= "H4_003N",
+    renter_dhc="H4_004N",
+    occhh_dhc="H4_001N",
+    total_hu_dhu="H1_001N"
+  ), 
+    state = all_states_abbr, 
+    year=2020,
+    geometry = FALSE, 
+    output="wide"
+)  %>%  
+  rename(GEOID_2020=GEOID)
+census_2020_dhc_harmonized <-census_2020_dhc_raw  %>% 
+  left_join(tract_crosswalk_2010_to_2020,by = c("GEOID_2020"="GEOID20"))  %>% 
+  filter(!is.na(GEOID10))  %>% 
+  group_by(tractid=GEOID10) %>% 
+  summarise(
+    owner_dhc=sum(owner_dhc,na.rm=TRUE),
+    renter_dhc=sum(renter_dhc,na.rm=TRUE),
+    occhh_dhc=sum(occhh_dhc,na.rm=TRUE),
+    total_hu_dhc=sum(total_hu_dhc,na.rm=TRUE),
+    .groups = 'drop'
+  )
+acs_vars_2020 <-c(
+  med_hh_income_acs="B19013_001", 
+  npov_acs="B17001_002",
+  fb_acs="B05001_006",
+  fhh_acs="B11003_008",
+)
+census_2020_acs_raw<-get_acs(
+  geography="tract", 
+  variables = acs_vars_2020, 
+  state=all_states_abbr,
+  year=2020, 
+  survey="acs5",
+  geometry=FALSE, 
+  output="wide"
+) %>%
+  rename(GEOID_2020=GEOID)
+
+census_2020_acs_harmonized <-census_2020_acs_raw  %>% 
+  left_join(tract_crosswalk_2010_to_2020,by = c("GEOID_2020"="GEOID20"))   %>% 
+  filter(!is.na(GEOID10))   %>% 
+  group_by(tractid=GEOID10)  %>% 
+  summarise(
+    hinc_acs= median (med_hh_income_acs,na.rm=TRUE),
+    npov_acs= sum(npov_acs,na.rm=TRUE),
+    fb_acs= sum(fb_acs,na.rm=TRUE),
+    fhh_acs=sum(fhh_acs,na.rm=TRUE),
+    .groups= 'drop'
+  )
+# final merge 
+ltdb_2020 <-ltdb_2020_full  %>% 
+  left_join(census_2020_dhc_harmonized, by="tractid") %>% 
+  left_join(census_2020_acs_harmonized,by="tractid")  %>%
+  
+  mutate(
+    owner= coalesce(owner_dhc,owner),
+    renter=coalesce(renter_dhc,renter), 
+    occhh=coalesce(occhh_dhc,occhh), 
+    total_hu=coalesce(total_hu_dhc,total_hu),
+    hinc=coalesce(hinc_acs,hinc), 
+    npov=coalesce(npov_acs,npov), 
+    fb=coalesce(fb_acs,fb), 
+    fhh=coalesce(fhh_acs,fhh)
+
+  ) %>% 
+  select(-ends_with("_dhc"),-ends_with(".base"), -ends_with(".acs"))  %>% 
+  select(
+    tractid,total_pop,owner,renter,occhh,hinc,npov,nhwht,nhblk,hisp,asian,ntv,fb,fhh,total_hu
+  )
+#Step 4 GEOID standardize 
+standardize_geoid <-function(df) {
+  df  %>% mutate(GEOID=str_pad(tractid,width=11,pad="0"))
+}
+all_data_list <-list(ltdb_1980,ltdb_1990,ltdb_2000,ltdb_2010,ltdb_2012,ltdb_2019,ltdb_2020)
+all_data_list <-map(all_data_list,standardize_geoid) 
+all_data_list<-map(all_data_list,~ left_join(.,crosswalk,by="GEOID") %>% 
+                filter(cbsa13 %in% top_msa_fips))
+#Step 6 cleaning 
+safe_col<-function(df,col_name, default_type_na = NA_real_) {
+  if(col_name%in% names(df)){
+    return(df[[col_name]])
+  }else {
+    if(is.character(default_type_na)){
+      return(rep(NA_character_,nrow(df)))
+    } else {
+      return(rep(NA_real_,nrow(df)))
+    }
+  }
+}
+clean_ltdb<- function(df,year_val){
+  df %>% 
+    transmute(
+      GEOID, 
+      cbsa13=cbsa13,
+      year= year_val, 
+      owner=safe_col(df,"owner"),
+      renter=safe_col(df,"renter"),
+      occhh=safe_col(df,"occhh"),
+      total_pop=safe_col(df,"total_pop"),
+      hinc=safe_col(df,"hinc"),
+      npov=safe_col(df,"npov"),
+      nhwht=safe_col(df,"nhwht"),
+      nhblk=safe_col(df,"nhblk"),
+      hisp=safe_col(df,"hisp"),
+      asian=safe_col(df,"asian"),
+      ntv=safe_col(df,"ntv"), 
+      fb=safe_col(df,"fb"), 
+      fhh=safe_col(df,"fhh"), 
+      total_hu=safe_col(df,"total_hu")
+      
+    )
+}
+years <-c(1980,1990,2000,2010,2012,2019,2020)
+ltdb_clean_list <-map2(all_data_list,years, clean_ltdb)
+# Step 7 Stack 
+ltdb_long <-bind_rows(ltdb_clean_list) %>% 
+  mutate(
+    pct_rent=renter/occhh,
+    pct_own=owner/occhh,
+    pct_poverty= npov/total_pop,
+    pct_nhwht=nhwht/total_pop,
+    pct_nhblk=nhblk/total_pop,
+    pct_hisp=hisp/total_pop,
+    pct_asian=asian/total_pop,
+    pct_ntv=ntv/total_pop,
+    pct_foreign=fb/total_pop,
+    pct_fhh=fhh/occhh,
+    pct_occupied= occhh/total_hu,
+    decade=case_when(
+      year==1980 ~ "1980",
+      year==1990 ~ "1990",
+      year==2000 ~ "2000",
+      year==2010 ~ "2010",
+      year==2012 ~ "2010s_ACS_2008_2012",
+      year==2019 ~ "2010s_ACS_2015_2019",
+      year==2020 ~ "2020",
+      TRUE ~ NA_character_
+    )
+    
+  ) %>%  
+  mutate(across(starts_with("pct_"),  ~ ifelse(is.nan(.),0,.))) %>%  
+  mutate(across(starts_with("pct_"),  ~ifelse(is.infinite(.),NA_real_,.))) %>% 
+  mutate(
+    npov=replace_na(npov,0),
+    fb=replace_na(fb,0),
+    fhh=replace_na(fhh,0),
+    owner=replace_na(owner,0),
+    renter=replace_na(renter,0)
+  )
+write_csv(ltdb_long,"ltdb_cleaned_long.csv")
+
+  
