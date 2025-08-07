@@ -1,0 +1,234 @@
+library(tidyverse) 
+library(readr)
+library(stringr)   
+library(dplyr)    
+library(tidyr)
+library(ggplot2) 
+library(sf)
+library(tigris)
+library(purrr)
+crosswalk <- read_csv("geocorr_tract_to_cbsa_2018.csv",
+                      col_types = cols(
+                        county = col_character(),
+                        tract = col_character(),
+                        cbsa13 = col_character()
+                      ),
+                      show_col_types = FALSE) %>%
+  mutate(GEOID = paste0(str_pad(county, 5, "left", "0"), str_pad(str_remove(tract, "\\."), 6, "left", "0")))
+
+msa_pop_2010 <- crosswalk %>%
+  group_by(cbsa13, cbsaname) %>%
+  summarise(population = sum(pop10, na.rm = TRUE), .groups = 'drop') %>%
+  arrange(desc(population)) %>%
+  slice_head(n = 100)
+top_msa_fips <- msa_pop_2010$cbsa13
+message("Data for the crosswalks and MSAs are loaded")
+
+lihtc_data_cleaned <- read_csv("100MSAs_lihtc_cleaned.csv",
+                               col_types = cols(
+                                 hud_id = col_character(),
+                                 cbsa = col_character(),
+                                 tractID = col_character(),
+                                 year = col_integer(),
+                                 total_units = col_integer(),
+                                 low_income_units = col_integer()
+                               ),
+                               show_col_types = FALSE) %>%
+  rename(
+    GEOID = tractID,
+    Placed_in_Service_Year = year,
+    LIHTC_Units = low_income_units
+  ) %>%
+  mutate(GEOID = str_pad(GEOID, 11, "left", "0")) %>%
+  filter(Placed_in_Service_Year >= 1987)
+message("LIHTC placement data is loaded")    
+
+ltdb_long <- read_csv("ltdb_cleaned_long.csv",
+                      col_types = cols(
+                        GEOID = col_character(),
+                        cbsa13 = col_character(),
+                        .default = col_double()
+                      ),
+                      show_col_types = FALSE) %>%
+  mutate(GEOID= as.character(GEOID))
+message("The LTDB has been data loaded.")
+
+#now I am finding the different tract level measurements for the tenure seg
+ltdb_long_with_seg_measures<ltdb_long  %>%
+group_by(cbsa13,year) %>%
+mutate(
+  tenure_diss_percentile=percent_rank(pct_rent)*100, 
+  .groups='drop'
+)  %>%
+  ungroup() %>%
+  group_by(cbsa13,year) %>%
+  mutate(pct_rent_msa_avg=ifelse(sum(occhh,nr.rm=TRUE)==0,0,sum(renter,na.rm=TRUE)/sum(occhh,na.rm=TRUE)),
+         signed_di_tenure=pct_rent-pct_rent_msa_avg
+  ) %>%
+  ungroup() %>% 
+  filter(
+    !is.na(tenure_diss_percentile)& !is.infinite(tenure_diss_percentile)& !is.nan(tenure_diss_percentile),
+    !is.na(signed_di_tenure)& !is.infinite(signed_di_tenure)& !is.nan(signed_di_tenure)
+  )
+message("Signed Di for tract levels have been measured")
+
+lihtc_annual_by_tract<-lihtc_data_cleaned %>% 
+group_by(GEOID,Placed_in_Service_Year)%>% 
+summarise(annual_lihtc_units=sum(LIHTC_Units,na.rm=TRUE),.groups='drop') %>%
+rename(year=Placed_in_Service_Year)
+
+all_ltdb_years<-sort(unique(ltdb_long$year))
+all_ltdb_geoids<-sort(unique(ltdb_long$GEOID))
+
+full_panel_for_cumulative<-expand_grid(
+  GEOID=all_ltdb_geoids,
+  year=all_ltdb_years
+)
+
+cumulative_lihtc_by_year_df<-full_panel_for_cumulative %>% 
+left_join(lihtc_annual_by_tract,by=c("GEOID","year")) %>% 
+mutate(annual_lihtc_units=replace_na(annual_lihtc_units,0)) %>% 
+arrange(GEOID,year)%>% 
+group_by(GEOID) %>% 
+mutate(cumulative_lihtc_temp=cumsum(annual_lihtc_units)) %>% 
+ungroup()%>% 
+select(GEOID,year,cumulative_lihtc_by_year=cumulative_lihtc_temp)
+message("Cumulative units are found")
+
+case_study_msas<-tibble(
+  cbsa13=c("35620","37980","26420","16980"), 
+  cbsaname=c(
+    "New York-Newark-Jersey City,NY-NJ-PA",
+    "Philadelphia-Camden-Wilmington,PA-NJ-DE-MD",
+    "Houston-The Woodlands-Sugar Land, TX", 
+    "Chicago-Naperville-Elgin, IL-IN-WI")
+) %>% 
+  mutate(cbsa13=as.character(cbsa13))
+message("MSAs for case study have been found and defined")
+
+states_for_tigris<-c("NY","NJ","PA", "DE","MD", "TX", "IL", "IN", "WI")
+
+#I am downloading the tracts shape files for the states via purrr 
+
+suppressMessages(
+  all_tracts_2010<-map_dfr(states_for_tigris,function(state_abbr){
+    message(paste0("Getting the tracts for",state_abbr,"..."))
+    current_tracts<-tigris::tracts(state=state_abbr, year=2010, class="sf")
+    
+    if("GEOID10" %in% names(current_tracts)){
+      current_tracts_processed<-current_tracts %>% 
+        rename(GEOID=GEOID10)
+    } else if(all(c("STATEFP","COUNTYFP","TRACTCE") %in% names(current_tracts))){
+      current_tracts_processed<-current_tracts %>% 
+      mutate(GEOID=paste0(STATEFP,COUNTYFP,TRACTCE))
+    } else { 
+      stop(paste0("Cannot find the GEOID column"))
+    }
+    current_tracts_processed %>% 
+      mutate(GEOID=str_pad(GEOID,11,"left","0"))%>% 
+      mutate(GEOID=as.character(GEOID)) %>% 
+      select(GEOID,geometry)
+  })
+) 
+    
+# Now I am filtering the tracts for the 4 MSAs for the case study 
+
+case_study_tracts_spatial<-all_tracts_2010 %>% 
+left_join(crosswalk %>% select(GEOID,cbsa13),by="GEOID") %>% 
+filter(cbsa13 %in% case_study_msas$cbsa13) %>% 
+filter(!is.na(cbsa13))
+message("Got all the spatial data and it is ready")
+
+#Creating the maps 
+map_year<-2019
+map_data<-case_study_tracts_spatial %>% 
+  left_join(ltdb_long_with_seg_measures %>% 
+  filter(year== map_year) %>%
+  select(GEOID,cbsa13,signed_di_tenure,type),
+  by= c ("GEOID","cbsa13")
+) %>% 
+left_join(cumulative_lihtc_by_year_df %>% 
+filter(year==map_year) %>%        
+  select(GEOID,cumulative_lihtc_by_year),
+  by="GEOID"
+) %>%
+left_join (case_study_msas, by="cbsa13") %>% 
+filter(!is.na(signed_di_tenure) & !is.na(cumulative_lihtc_by_year)) %>% 
+mutate(log_lihtc_units=log1p(cumulative_lihtc_by_year))
+
+#CASE STUDY MAPS 
+lihtc_breaks_original<-c(0,1,10,100,1000)
+lihtc_breaks_log1p<-log1p(lihtc_breaks_original)
+lihtc_labels<-c("0 units","1-9 units","10-49 units","50-249 units ","250-999","1000+ units")
+
+#Here I am making a max and min for density and signed di
+global_min_lihtc_units<-min(map_data$cumulative_lihtc_by_year,na.rm=TRUE)
+global_max_lihtc_units<-max(map_data$cumulative_lihtc_by_year,na.rm=TRUE)
+fixed_lihtc_limits<-c(global_min_lihtc_units,global_max_lihtc_units)
+
+global_min_signed_di<-min(map_data$signed_di_tenure,na.rm=TRUE)
+global_max_signed_di<-max(map_data$signed_di_tenure,na.rm=TRUE)
+max_abs_deviation<-max(abs(global_min_signed_di),abs(global_max_signed_di))
+fixed_signed_di_limits<-c(-max_abs_deviation,max_abs_deviation)
+
+for(i in 1:nrow(case_study_msas)){
+  current_msa_cbsa13<-case_study_msas$cbsa13[i]
+  current_msa_name<-case_study_msas$cbsaname[i]
+  clean_msa_name<-gsub("[^A-Za-z0-9_]","",gsub("","_",current_msa_name))
+  message(paste0("Making the maps for the different case study MSAs"))
+  
+  map_data_msa<-map_data  %>% 
+  filter(cbsa13==current_msa_cbsa13)
+  
+  #LIHTC DENISTY MAPS
+  p_lihtc_map_msa<-ggplot(map_data_msa,aes(fill=log_lihtc_units))+
+    geom_sf(color=NA) + 
+    labs( 
+      title=paste0("Cumulative LIHTC Unit Density in", current_msa_name," (",map_year,")"), 
+      caption="Source:HUD LIHTC Database;LTDB;U.S.Census Bureau (2010 Tracts)", 
+      fill="Cumulative LIHTC Units"
+    )+ 
+    scale_fill_viridis_c(
+      option="cividis",
+      direction=-1,
+      breaks=lihtc_breaks_mapped,
+      labels=lihtc_labels, 
+      limits=fixed_lihtc_limits,
+      na.value = "grey80"
+    ) + 
+    theme_minimal()+ 
+    theme( 
+      plot.title=element_text(hjust=0.5,face="bold"),
+      axis.text=element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid=element_blank()
+      
+    ) 
+  ggsave(paste0("map_lihtc_density_",clean_msa_name,"_",map_year,".png"),plot=p_lihtc_map_msa,width=10,height=10,dpi=300)
+  message(paste0("Map for lihtc density are saved")) 
+
+# Signed Di Maps for Case Study 
+p_signed_di_tenure_map_msa<-ggplot(map_data_msa,aes(fill=signed_di_tenure))+
+  geom_sf(color=NA) + 
+  labs( 
+    title=paste0("Signed Tenure Dissimilarity Index in ", current_msa_name," (",map_year,")"), 
+    subtitle="Positive values:renter-heavy;Negative values:owner-heavy (relative to MSA average).",
+    caption="Source:LTDB;U.S.Census Bureau (2010 Tracts)", 
+    fill="Signed Tenure Dissimilarity Index"
+  )+ 
+  scale_fill_gradient2(
+    low="red", mid="white", high="blue", 
+    midpoint=0,
+    limits=fixed_signed_di_limits
+  )+ 
+  theme_minimal()+ 
+  theme( 
+    plot.title=element_text(hjust=0.5,face="bold"),
+    plot.subtitle = element_text(hjust=0.5),
+    axis.text=element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid=element_blank()
+  ) 
+ggsave(paste0("map_signed_di_tenure_",clean_msa_name,"_",map_year,".png"),p_signed_di_tenure_map_msa,width=10,height=10,dpi=300)
+message(paste0("Map for signed_di_tenure are saved")) 
+} 
