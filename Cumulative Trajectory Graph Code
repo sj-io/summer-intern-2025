@@ -1,0 +1,163 @@
+library(tidyverse) 
+library(stringr)   
+library(dplyr)    
+library(tidyr)
+library(ggplot2)  
+
+crosswalk <- read_csv("geocorr_tract_to_cbsa_2018.csv",
+col_types = cols(
+county = col_character(),
+tract = col_character(),
+cbsa13 = col_character()
+),
+show_col_types = FALSE) %>%
+mutate(GEOID = paste0(str_pad(county, 5, "left", "0"), str_pad(str_remove(tract, "\\."), 6, "left", "0")))
+                                                                                                                            
+msa_pop_2010 <- crosswalk %>%
+group_by(cbsa13, cbsaname) %>%
+summarise(population = sum(pop10, na.rm = TRUE), .groups = 'drop') %>%
+arrange(desc(population)) %>%
+slice_head(n = 100)
+top_msa_fips <- msa_pop_2010$cbsa13
+message("Data for the crosswalks and MSAs are loaded")
+
+lihtc_data_cleaned <- read_csv("100MSAs_lihtc_cleaned.csv",
+col_types = cols(
+hud_id = col_character(),
+cbsa = col_character(),
+tractID = col_character(),
+year = col_integer(),
+total_units = col_integer(),
+low_income_units = col_integer()
+),
+show_col_types = FALSE) %>%
+rename(
+GEOID = tractID,
+Placed_in_Service_Year = year,
+LIHTC_Units = low_income_units
+ ) %>%
+mutate(GEOID = str_pad(GEOID, 11, "left", "0")) %>%
+filter(Placed_in_Service_Year >= 1987)
+message("LIHTC placement data is loaded")                                                                                   
+ltdb_long <- read_csv("ltdb_cleaned_long.csv",
+col_types = cols(
+GEOID = col_character(),
+cbsa13 = col_character(),
+.default = col_double()
+),
+show_col_types = FALSE) %>%
+mutate(GEOID= as.character(GEOID))
+message("The LTDB has been data loaded.")
+
+decade_buckets <- tibble(
+start_year = c(1987, 1991, 2001, 2012),
+end_year = c(1990, 2000, 2011, 2020), # The data goes up to 2020 but we are using up to 2019 
+decade_label = c("1987-1990", "1991-2000", "2001-2011", "2012-2019") 
+)
+lihtc_by_tract_decade_temp <- lihtc_data_cleaned %>%
+mutate(
+decade_group = case_when(
+Placed_in_Service_Year >= 1987 & Placed_in_Service_Year <= 1990 ~ "1987-1990",
+Placed_in_Service_Year >= 1991 & Placed_in_Service_Year <= 2000 ~ "1991-2000",
+Placed_in_Service_Year >= 2001 & Placed_in_Service_Year <= 2011 ~ "2001-2011",
+Placed_in_Service_Year >= 2012 & Placed_in_Service_Year <= 2020 ~ "2012-2019",
+TRUE ~ NA_character_
+)
+) %>%
+filter(!is.na(decade_group)) %>%
+group_by(GEOID, decade_group) %>%
+summarise(
+lihtc_units_decade = sum(LIHTC_Units, na.rm = TRUE),
+.groups = 'drop'
+)
+#Here I just check to make sure the data is being collected with a dummy structure
+dummy_lihtc_structure <- tibble(GEOID = character(), decade_group = character(), lihtc_units_decade = numeric())
+lihtc_by_tract_decade <- bind_rows(dummy_lihtc_structure, lihtc_by_tract_decade_temp) %>%
+filter(!(GEOID == "" & decade_group == "" & lihtc_units_decade == 0)) %>%
+mutate(has_lihtc_placement = if_else(lihtc_units_decade > 0, 1, 0))
+fixed_panel_tracts <- ltdb_long %>%
+filter(year == 1980) %>%
+distinct(GEOID) %>%
+pull(GEOID)
+total_fixed_panel_tracts <- length(fixed_panel_tracts)
+message(paste0("Total ammoung of tracts in fixed panel (denominator): ", total_fixed_panel_tracts))
+
+lihtc_status_for_stacked_bar_graph <- tibble()
+full_panel_grid_for_status_placement <- expand_grid(
+GEOID = fixed_panel_tracts,
+decade_group = unique(decade_buckets$decade_label)
+)
+for (i in 1:nrow(decade_buckets)) {
+current_decade_label <- decade_buckets$decade_label[i]
+current_start_year <- decade_buckets$start_year[i]
+current_placement_tracts_data <- lihtc_by_tract_decade %>%
+filter(decade_group == current_decade_label, lihtc_units_decade > 0) %>%
+select(GEOID, lihtc_units_decade)
+previous_placement_tracts_geoid_data <- lihtc_by_tract_decade %>%
+filter(decade_group %in% decade_buckets$decade_label[decade_buckets$end_year < current_start_year],
+lihtc_units_decade > 0) %>%
+pull(GEOID) %>%
+unique () 
+temp_df <- full_panel_grid_for_status_placement %>%
+filter(decade_group == current_decade_label) %>%
+mutate(
+has_lihtc_this_decade = (GEOID %in% current_placement_tracts_data$GEOID),
+had_lihtc_previously = (GEOID %in% previous_placement_tracts_geoid_data),
+status = case_when(
+has_lihtc_this_decade & had_lihtc_previously ~ "Previously received LIHTC & new units",
+has_lihtc_this_decade & !had_lihtc_previously ~ "New tracts (first LIHTC placement)",
+!has_lihtc_this_decade & had_lihtc_previously ~ "Previously received LIHTC & no new units",
+TRUE ~ "No LIHTC placement"
+)
+)
+lihtc_status_for_stacked_bar_graph <- bind_rows(lihtc_status_for_stacked_bar_graph, temp_df)
+}
+stacked_bar_graph_data_for_plotting <- lihtc_status_for_stacked_bar_graph %>%
+ group_by(decade_group, status) %>%
+summarise(
+n_tracts = n(),
+.groups = 'drop',
+ ) %>%
+ mutate(
+ percent_of_fixed_tracts = (n_tracts / total_fixed_panel_tracts) * 100
+ ) %>%
+mutate(
+decade_group = factor(decade_group, levels = decade_buckets$decade_label),
+status = factor(status, levels=c(
+"No LIHTC placement",
+"Previously received LIHTC & no new units",
+"New tracts (first LIHTC placement)",
+"Previously received LIHTC & new units"
+ ))
+)
+ message("Everything is ready to be used")
+ print(stacked_bar_graph_data_for_plotting)
+
+plot_title_stacked_bar_graph <- "Cumulative Trajectory of LIHTC Placement Over Time"
+file_name_stacked_bar_graph <- "lihtc_placement_status_stacked_bar_graph.png"
+
+stacked_bar_plot <- ggplot(stacked_bar_graph_data_for_plotting, aes(x = decade_group, y = percent_of_fixed_tracts, fill = status)) +
+  geom_col(position = "stack") +
+labs(
+title = plot_title_stacked_bar_graph,
+x = "Decade Range Placed in Service",
+y = "Percentage of Tracts in Fixed Panel",
+fill = "LIHTC Placement Status"
+)+
+scale_fill_manual(
+values=c(
+"No LIHTC placement"="grey80",
+"Previously received LIHTC & no new units" = "skyblue",
+"New tracts (first LIHTC placement)" = "tomato",
+"Previously received LIHTC & new units" = "forestgreen"
+)) + 
+scale_y_continuous(labels=scales::percent_format(scale=1),limits=c(0,100)) +
+theme_minimal() +
+theme(
+plot.title=element_text(hjust=0.5,face="bold"),
+axis.text.x= element_text(angle=55,hjust=1),
+legend.position="bottom"
+)
+print(stacked_bar_plot)
+ggsave(filename=file_name_stacked_bar_graph,plot= stacked_bar_plot, width=10, height=7, dpi=300)
+message(paste0("Plot saved: ", file_name_stacked_bar_graph))
